@@ -28,6 +28,23 @@ The provider is installed by monkey-patching `ProviderRegistry.create_factory` a
 - [KiroCrew](https://github.com/kirocrew/kirocrew) installed (`pip install kirocrew`)
 - An OpenAI-compatible API endpoint
 
+> **⚠️ Important — same virtual environment required**
+>
+> `gateway.py` **must** be run in the same Python virtual environment where
+> `kirocrew` is installed. If you get `ImportError: No module named 'kiro_crew'`,
+> you are running in a different env.
+>
+> Verify your active env:
+> ```bash
+> pip show kirocrew
+> # If this returns nothing, kirocrew is NOT in your current env.
+>
+> # Activate the correct venv:
+> source /path/to/kirocrew-venv/bin/activate
+> # Or use the venv's python directly:
+> /path/to/kirocrew-venv/bin/python gateway.py
+> ```
+
 ### Install Dependencies
 
 ```bash
