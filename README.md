@@ -2,6 +2,8 @@
 
 **Drop-in OpenAI-compatible backend for [KiroCrew](https://github.com/kirocrew/kirocrew).**
 
+<img width="1918" height="911" alt="image" src="https://github.com/user-attachments/assets/7e5288dd-4d75-48eb-b70a-6dd8608d08c5" />
+
 Run KiroCrew with any OpenAI-compatible API — Ollama, vLLM, LiteLLM, Together AI, Groq, OpenRouter, Azure OpenAI, or any endpoint that implements the `/v1/chat/completions` spec.
 
 No modifications to KiroCrew source code required. Works via runtime monkey-patching of the provider registry.
