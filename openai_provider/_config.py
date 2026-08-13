@@ -20,6 +20,8 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_TEMPERATURE = 0.0
+DEFAULT_COMPACTION_THRESHOLD = 80  # percent — trigger auto-compaction
+DEFAULT_COMPACTION_KEEP_RECENT = 6  # messages to keep (system + last N)
 
 # ── Known context windows ────────────────────────────────────────────────────
 # Used as a fallback when the /v1/models endpoint is unavailable or does not
@@ -85,7 +87,8 @@ def read_provider_config() -> dict[str, Any]:
     """Read provider configuration from environment variables.
 
     Returns a dict with keys: ``base_url``, ``api_key``, ``model``,
-    ``max_tokens``, ``context_window``, ``system_prompt``.
+    ``max_tokens``, ``context_window``, ``system_prompt``,
+    ``compaction_threshold``, ``compaction_keep_recent``.
     """
     return {
         "base_url": read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL),
@@ -94,6 +97,12 @@ def read_provider_config() -> dict[str, Any]:
         "max_tokens": read_env_int("OPENAI_MAX_TOKENS", DEFAULT_MAX_TOKENS),
         "context_window": read_env_int("OPENAI_CONTEXT_WINDOW") or None,
         "system_prompt": read_env_str("OPENAI_SYSTEM_PROMPT"),
+        "compaction_threshold": read_env_int(
+            "OPENAI_COMPACTION_THRESHOLD", DEFAULT_COMPACTION_THRESHOLD,
+        ),
+        "compaction_keep_recent": read_env_int(
+            "OPENAI_COMPACTION_KEEP_RECENT", DEFAULT_COMPACTION_KEEP_RECENT,
+        ),
     }
 
 

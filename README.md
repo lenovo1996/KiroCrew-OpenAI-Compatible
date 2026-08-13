@@ -18,6 +18,9 @@ KiroCrew Gateway  (sessions, memory, cron, approval ladder)
 OpenAIProvider  ← replaces AcpProvider at runtime
       ↓
 OpenAI-compatible HTTP API  (Ollama / vLLM / OpenAI / Azure / ...)
+
+Embedding path (separate):
+Knowledge / VectorMemory → OpenAIEmbeddingBackend → POST /v1/embeddings
 ```
 
 The provider is installed by monkey-patching `ProviderRegistry.create_factory` and `LLMPool._create_worker` before the gateway starts. All chat sessions, subagents, cron jobs, and knowledge extraction routes are covered.
@@ -92,6 +95,12 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | `OPENAI_CONTEXT_WINDOW` | *(auto-resolved)* | Model context window size. Auto-detected from `/v1/models` endpoint, with a built-in fallback map for common models. Set explicitly if auto-detection fails. |
 | `OPENAI_SYSTEM_PROMPT` | *(empty)* | Override the default system prompt |
 | `OPENAI_KNOWLEDGE_MODEL` | *(same as `OPENAI_MODEL`)* | Separate model for knowledge extraction (entity/relation extraction). Useful when you want a cheaper/faster model for background knowledge processing. |
+| `OPENAI_COMPACTION_THRESHOLD` | `80` | Context usage percentage that triggers auto-compaction (0 to disable) |
+| `OPENAI_COMPACTION_KEEP_RECENT` | `6` | Number of recent messages to preserve during compaction |
+| `EMBEDDING_BASE_URL` | *(same as `OPENAI_BASE_URL`)* | Embedding API endpoint URL |
+| `EMBEDDING_API_KEY` | *(same as `OPENAI_API_KEY`)* | Auth key for embedding API |
+| `EMBEDDING_MODEL` | `nvidia/nvidia/nemotron-3-embed-1b` | Embedding model id |
+| `EMBEDDING_DIM` | `2048` | Vector dimensionality (must match stored vectors) |
 
 ## Supported Features
 
@@ -106,6 +115,8 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | KiroCrew memory & cron | ✅ | Unaffected (KiroCrew layer) |
 | KiroCrew subagents | ✅ | Each subagent gets its own `OpenAIProvider` |
 | Knowledge extraction | ✅ | `OpenAIWorker` — non-streaming HTTP, no subprocess |
+| Context compaction | ✅ | Auto-summarizes old messages when context fills up |
+| Remote embedding backend | ✅ | Replaces bundled llama.cpp — saves ~610 MB RAM + 0% CPU |
 | MCP tool routing | ⚠️ | Best-effort via `McpToolExecutor` |
 
 ## Architecture
@@ -132,6 +143,23 @@ LLMPool._create_worker()  ← monkey-patched
 ```
 
 This is lighter than the original ACP workers — no kiro-cli subprocess spawned, just HTTP calls.
+
+### Embedding Path (Knowledge + Vector Memory)
+
+By default, KiroCrew bundles a llama.cpp runtime (~610 MB) that loads a local embedding model (Qwen3-Embedding-0.6B) and runs inference on CPU. This provider replaces it with a remote HTTP backend:
+
+```
+Knowledge / VectorMemory
+  → InProcessEmbedder
+    → OpenAIEmbeddingBackend  ← replaces LlamaCppEmbedder
+      → POST /v1/embeddings (remote API)
+```
+
+This eliminates:
+- **~610 MB RAM** (no model weights loaded)
+- **~189% CPU** (no local matrix multiplication on 2-core ARM)
+
+Configure via `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`. If the remote endpoint is unreachable, embedding returns `None` and KiroCrew falls back to keyword/FTS search.
 
 ### Code Review Sage
 
@@ -173,6 +201,21 @@ OPENAI_CONTEXT_WINDOW=128000
 OPENAI_SYSTEM_PROMPT="You are a helpful coding assistant specialized in Python."
 ```
 
+### Remote Embedding Backend
+
+Replace the bundled llama.cpp model with a remote embedding API:
+
+```bash
+EMBEDDING_BASE_URL=http://your-api:20128/v1
+EMBEDDING_API_KEY=sk-...
+EMBEDDING_MODEL=nvidia/nvidia/nemotron-3-embed-1b
+EMBEDDING_DIM=2048
+```
+
+Any OpenAI-compatible `/v1/embeddings` endpoint works. The backend validates output dimensions and retries transient failures (3 attempts with exponential backoff).
+
+> **Note**: Changing the embedding model invalidates stored vectors. KiroCrew will re-embed them in the background via the new endpoint.
+
 ## File Structure
 
 ```
@@ -180,12 +223,14 @@ KiroCrew-OpenAI-Compatible/
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── .env.example                  # Template for environment variables
 ├── gateway.py                   # Entry point — start KiroCrew with OpenAI provider
 └── openai_provider/             # Python package
     ├── __init__.py              # Public API: install()
     ├── _config.py               # Shared config, env vars, known model map
     ├── provider.py              # OpenAIProvider (LLMProvider implementation)
     ├── install.py               # Monkey-patches KiroCrew ProviderRegistry + LLMPool
+    ├── embedding_backend.py     # OpenAIEmbeddingBackend (replaces bundled llama.cpp)
     ├── mcp_executor.py          # Bridges tool calls → KiroCrew MCP servers
     ├── openai_worker.py         # OpenAIWorker for knowledge extraction
     ├── test_openai_worker.py    # Tests for OpenAIWorker + shared config
@@ -215,11 +260,9 @@ install(tool_executor=MyExecutor())
 
 1. **Session persistence**: OpenAIProvider keeps conversation history in-memory. On gateway restart, history is lost (no kiro-cli session file). A future version may serialize `_messages` to disk via `session_key`.
 
-2. **Context compaction**: Auto-compaction when context fills up is not yet implemented. The provider tracks context usage percentage but does not summarize old history automatically.
+2. **Multimodal**: Image attachments are not passed through to vision-capable APIs yet.
 
-3. **Multimodal**: Image attachments are not passed through to vision-capable APIs yet.
-
-4. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
+3. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
 
 ## Contributing
 
