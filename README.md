@@ -90,6 +90,8 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | `OPENAI_CONTEXT_WINDOW` | *(auto-resolved)* | Model context window size. Auto-detected from `/v1/models` endpoint, with a built-in fallback map for common models. Set explicitly if auto-detection fails. |
 | `OPENAI_SYSTEM_PROMPT` | *(empty)* | Override the default system prompt |
 | `OPENAI_KNOWLEDGE_MODEL` | *(same as `OPENAI_MODEL`)* | Separate model for knowledge extraction (entity/relation extraction). Useful when you want a cheaper/faster model for background knowledge processing. |
+| `OPENAI_COMPACTION_THRESHOLD` | `80` | Context usage percentage that triggers auto-compaction (0 to disable) |
+| `OPENAI_COMPACTION_KEEP_RECENT` | `6` | Number of recent messages to preserve during compaction |
 
 ## Supported Features
 
@@ -104,6 +106,7 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | KiroCrew memory & cron | ✅ | Unaffected (KiroCrew layer) |
 | KiroCrew subagents | ✅ | Each subagent gets its own `OpenAIProvider` |
 | Knowledge extraction | ✅ | `OpenAIWorker` — non-streaming HTTP, no subprocess |
+| Context compaction | ✅ | Auto-summarizes old messages when context fills up |
 | MCP tool routing | ⚠️ | Best-effort via `McpToolExecutor` |
 
 ## Architecture
@@ -213,11 +216,9 @@ install(tool_executor=MyExecutor())
 
 1. **Session persistence**: OpenAIProvider keeps conversation history in-memory. On gateway restart, history is lost (no kiro-cli session file). A future version may serialize `_messages` to disk via `session_key`.
 
-2. **Context compaction**: Auto-compaction when context fills up is not yet implemented. The provider tracks context usage percentage but does not summarize old history automatically.
+2. **Multimodal**: Image attachments are not passed through to vision-capable APIs yet.
 
-3. **Multimodal**: Image attachments are not passed through to vision-capable APIs yet.
-
-4. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
+3. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
 
 ## Contributing
 

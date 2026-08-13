@@ -103,6 +103,8 @@ def install(
             context_window=cfg["context_window"],
             tool_executor=executor,
             session_key=session_key,
+            compaction_threshold=cfg.get("compaction_threshold", 80),
+            compaction_keep_recent=cfg.get("compaction_keep_recent", 6),
         )
 
     # ── Patch 1: build_provider_factory (module-level function) ──────────────
@@ -139,6 +141,15 @@ def install(
     except Exception as exc:
         logger.warning(
             "openai_provider: knowledge worker registration skipped: %s", exc
+        )
+
+    # ── Patch 4: Embedding backend (replace bundled llama.cpp) ─────────────
+    try:
+        from .embedding_backend import register_remote_embedding
+        register_remote_embedding()
+    except Exception as exc:
+        logger.warning(
+            "openai_provider: embedding backend registration skipped: %s", exc
         )
 
     _installed = True

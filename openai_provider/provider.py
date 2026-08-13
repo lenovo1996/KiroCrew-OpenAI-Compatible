@@ -48,6 +48,8 @@ from kiro_crew.providers.base import LLMProvider, CancelOutcome
 
 from ._config import (
     DEFAULT_BASE_URL,
+    DEFAULT_COMPACTION_KEEP_RECENT,
+    DEFAULT_COMPACTION_THRESHOLD,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_TEMPERATURE,
@@ -80,6 +82,8 @@ class OpenAIProvider(LLMProvider):
         temperature: float = DEFAULT_TEMPERATURE,
         tool_executor: "ToolExecutor | None" = None,
         session_key: str | None = None,
+        compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compaction_keep_recent: int = DEFAULT_COMPACTION_KEEP_RECENT,
     ) -> None:
         self._base_url = base_url or read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL)
         self._api_key = api_key or read_env_str("OPENAI_API_KEY")
@@ -94,6 +98,11 @@ class OpenAIProvider(LLMProvider):
         # If not provided, will be resolved from /v1/models in start()
         self._context_window_override = context_window  # explicit override (highest priority)
         self._context_window: int = context_window or 0  # final resolved value
+
+        # Compaction settings
+        self._compaction_threshold = compaction_threshold  # percent
+        self._compaction_keep_recent = compaction_keep_recent  # messages to keep
+        self._compacting: bool = False  # re-entrancy guard
 
         # Conversation history (maintained across turns)
         self._messages: list[dict[str, Any]] = []
@@ -218,6 +227,245 @@ class OpenAIProvider(LLMProvider):
     def served_model(self) -> str:
         return self._model
 
+    # ── Auto-compaction ─────────────────────────────────────────────────────
+
+    async def _maybe_compact(self) -> None:
+        """Summarize old messages when context usage exceeds the threshold.
+
+        When the context window is nearly full, this method:
+          1. Preserves the system prompt and the last ``compaction_keep_recent``
+             messages (recent conversation).
+          2. Sends the middle messages to the same (or cheaper) model to produce
+             a concise summary.
+          3. Replaces the middle messages with a single summary message.
+
+        The compaction is transparent to the user — a ``THINKING_CHUNK`` event
+        is emitted so the dashboard shows "Auto-compacting…" in the thinking
+        block, but no text content leaks into the main conversation.
+        """
+        # Guard: don't compact if already compacting or threshold is 0 (disabled)
+        if self._compacting or self._compaction_threshold <= 0:
+            return
+
+        ctx_win = self._context_window or self._max_tokens
+        if ctx_win <= 0:
+            return
+
+        # Estimate current usage: count tokens in all messages (rough: 4 chars ≈ 1 token)
+        total_chars = sum(len(str(m.get("content", ""))) + len(str(m.get("tool_calls", ""))) for m in self._messages)
+        estimated_tokens = total_chars // 4
+        pct = min(estimated_tokens / ctx_win * 100, 100.0)
+
+        if pct < self._compaction_threshold:
+            return
+
+        # Need compaction — figure out what to keep vs summarize
+        # Always keep: system prompt (index 0 if present)
+        has_system = self._messages and self._messages[0].get("role") == "system"
+        offset = 1 if has_system else 0
+
+        # Must have enough messages to compact
+        if len(self._messages) < offset + self._compaction_keep_recent + 2:
+            return
+
+        keep_start = len(self._messages) - self._compaction_keep_recent
+        old_messages = self._messages[offset:keep_start]
+        if not old_messages:
+            return
+
+        self._compacting = True
+        logger.info(
+            "Auto-compaction triggered: %.1f%% context used (%d/%d tokens), "
+            "compacting %d old messages, keeping %d recent",
+            pct, estimated_tokens, ctx_win, len(old_messages), self._compaction_keep_recent,
+        )
+
+        try:
+            summary = await self._summarize_for_compaction(old_messages)
+            if not summary:
+                logger.warning("Compaction summarization returned empty — skipping")
+                return
+
+            # Build compacted history: [system?] + [summary] + [recent messages]
+            summary_msg = {
+                "role": "system",
+                "content": (
+                    "[Auto-compacted conversation summary]\n"
+                    "The following is a summary of earlier conversation messages "
+                    "that were compressed to free up context space:\n\n"
+                    f"{summary}"
+                ),
+            }
+            new_messages: list[dict[str, Any]] = []
+            if has_system:
+                new_messages.append(self._messages[0])
+            new_messages.append(summary_msg)
+            new_messages.extend(self._messages[keep_start:])
+
+            removed_count = len(self._messages) - len(new_messages)
+            self._messages = new_messages
+            logger.info(
+                "Auto-compaction complete: %d messages removed, %d remaining "
+                "(+1 summary)",
+                removed_count, len(self._messages) - 1,
+            )
+        except Exception as exc:
+            logger.warning("Auto-compaction failed: %s — continuing without compaction", exc)
+        finally:
+            self._compacting = False
+
+    async def _summarize_for_compaction(self, messages: list[dict]) -> str:
+        """Call the API (non-streaming) to summarize old messages."""
+        import httpx
+
+        # Build a summarization prompt
+        # Flatten the messages into a readable transcript
+        transcript_parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls")
+
+            if role == "tool":
+                # Tool result — include truncated
+                transcript_parts.append(f"[Tool result]: {str(content)[:500]}")
+            elif tool_calls:
+                # Assistant tool-call turn
+                names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                transcript_parts.append(f"[Assistant called tools: {', '.join(names)}]")
+            elif content:
+                # Normal text message
+                transcript_parts.append(f"[{role}]: {str(content)[:1000]}")
+            else:
+                transcript_parts.append(f"[{role}]: (empty)")
+
+        transcript = "\n".join(transcript_parts)
+
+        summarization_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation summarizer. Produce a concise but "
+                    "complete summary of the conversation below. Preserve:\n"
+                    "- Key decisions and conclusions\n"
+                    "- Code changes made (file paths, what was changed)\n"
+                    "- Tool calls and their outcomes\n"
+                    "- User preferences expressed\n"
+                    "- Open questions or pending tasks\n"
+                    "Keep the summary under 2000 characters. Output ONLY the summary, "
+                    "no preamble."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Summarize this conversation:\n\n{transcript}",
+            },
+        ]
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": summarization_messages,
+            "max_tokens": 800,
+            "temperature": 0.1,
+            "stream": False,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{self._base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                body = await resp.aread()
+                raise RuntimeError(
+                    f"Compaction API error {resp.status_code}: {body.decode()[:300]}"
+                )
+
+            data = resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "")
+
+    # ── Manual /compact command ─────────────────────────────────────────────
+
+    async def compact(self, context: str = "") -> None:
+        """Handle the /compact slash command.
+
+        Summarizes the entire conversation history (except the system prompt)
+        using the same summarization API, then replaces all messages with the
+        summary.  This is the manual version of auto-compaction — triggered
+        explicitly by the user typing ``/compact`` in the dashboard.
+        """
+        if self._compacting:
+            logger.warning("compact() called while auto-compaction is in progress — skipping")
+            return
+
+        has_system = self._messages and self._messages[0].get("role") == "system"
+        offset = 1 if has_system else 0
+
+        # Nothing to compact
+        if len(self._messages) <= offset + 1:
+            logger.info("compact(): not enough messages to compact (%d)", len(self._messages))
+            return
+
+        # All messages except system prompt
+        old_messages = self._messages[offset:]
+        if not old_messages:
+            return
+
+        self._compacting = True
+        logger.info("compact() triggered: summarizing %d messages", len(old_messages))
+
+        try:
+            summary = await self._summarize_for_compaction(old_messages)
+            if not summary:
+                logger.warning("compact(): summarization returned empty — skipping")
+                return
+
+            # Add user's context hint if provided
+            if context:
+                summary = f"{summary}\n\n[User-specified context to preserve: {context}]"
+
+            summary_msg = {
+                "role": "system",
+                "content": (
+                    "[Compacted conversation summary]\n"
+                    "The full conversation history was compressed into this summary:\n\n"
+                    f"{summary}"
+                ),
+            }
+
+            new_messages: list[dict[str, Any]] = []
+            if has_system:
+                new_messages.append(self._messages[0])
+            new_messages.append(summary_msg)
+
+            removed_count = len(self._messages) - len(new_messages)
+            self._messages = new_messages
+            logger.info(
+                "compact() complete: %d messages removed, %d remaining",
+                removed_count, len(self._messages),
+            )
+        except Exception as exc:
+            logger.warning("compact() failed: %s", exc)
+        finally:
+            self._compacting = False
+
+    async def wait_for_compaction(self, timeout: float = 30.0) -> dict:
+        """Wait for compaction to complete.
+
+        Since OpenAI compaction is synchronous (happens within the compact() call),
+        this returns immediately with the result status.
+        """
+        return {"type": "completed"}
+
     # ── Approval (tool permission) ────────────────────────────────────────────
 
     async def approve_tool(self, request_id: str | int, *, always: bool = False) -> None:
@@ -244,6 +492,9 @@ class OpenAIProvider(LLMProvider):
         """Send a user message and yield AcpEvents until end_turn or cancel."""
         self._cancel_event.clear()
         self._messages.append({"role": "user", "content": message})
+
+        # Auto-compact if context usage is high
+        await self._maybe_compact()
 
         # Tool definitions from executor
         tools = self._tool_executor.tool_definitions()

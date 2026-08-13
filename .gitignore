@@ -7,11 +7,22 @@ build/
 *.egg
 .eggs/
 *.so
-.env
 .venv
 venv/
 ENV/
-*.log
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# ── Environment files (contain secrets) ────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Service wrapper & runtime artifacts ────────────────────────────
+manage.sh
+openai-gateway.service
+*.pid
+*.log
+logs/
+nohup.out
