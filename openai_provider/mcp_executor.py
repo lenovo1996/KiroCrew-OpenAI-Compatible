@@ -2,35 +2,329 @@
 
 KiroCrew manages its own MCP servers (kirocrew-core, kirocrew-cron, file tools,
 bash, etc.). This executor exposes those tools to the OpenAI model as standard
-function-calling definitions, then routes execution back through the MCP client.
+function-calling definitions, then routes execution back through the MCP gateway.
 
-The MCP tool schema is fetched lazily on first use so the executor doesn't need
-a live session at import time.
+Architecture:
+    OpenAI Model
+      → McpToolExecutor.execute(name, args)
+        → _call_tool(name, args)
+          ├── Local registry handlers (read, write, edit, grep, glob, find,
+          │   list_dir, web_fetch, web_search, execute_bash, ask_question,
+          │   spawn_run, spawn_list) — reimplemented in Python because
+          │   kiro-cli's Go built-ins are not available here
+          └── Dynamic MCP tools — discovered from managed servers (kirocrew-core,
+              kirocrew-cron, kirocrew-computer) via in-process _list_tools(),
+              executed by spawning the server and calling via MCP stdio protocol
 
-Built-in fallback tools (read, write, edit, grep, glob, find, list_dir,
-web_fetch, web_search) are handled locally when no MCP server is available.
-This is necessary because kiro-cli's built-in tools (written in Go) are not
-MCP servers — they only exist inside the ACP runtime. The OpenAI provider
-bypasses kiro-cli entirely, so these tools must be reimplemented as Python
-handlers.
+Discovery:
+    1. Managed servers: import module → _list_tools() → full tool schemas
+    2. Non-managed servers: mcp_discovery.list_servers() → spawn → tools/list
+    3. Merge with local handlers (local takes priority for name conflicts)
+
+Execution:
+    1. Local registry handler (O(1) dict lookup, zero-latency)
+    2. MCP stdio protocol (spawn server → tools/call → parse result)
+    3. Error with available-tools hint
 """
 
 from __future__ import annotations
 
 import asyncio
-import glob as _glob_mod
+import importlib
 import json
 import logging
 import os
-import re
-import subprocess
-from pathlib import Path
+import shutil
 from typing import Any
 
 from .provider import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
+
+# ── Managed server tool discovery (in-process, no spawn) ─────────────────────
+
+# These are the managed MCP servers whose _list_tools() we can call directly
+# without spawning a subprocess. Same list as mcp_discovery._MANAGED_SERVER_TOOL_MODULES.
+_MANAGED_SERVER_MODULES = {
+    "kirocrew-core": "kiro_crew.mcp_core",
+    "kirocrew-cron": "kiro_crew.mcp_cron",
+    "kirocrew-computer": "kiro_crew.mcp_computer",
+}
+
+
+def _discover_managed_tools() -> tuple[list[dict], dict[str, list[str]]]:
+    """Discover tools from managed MCP servers by calling _list_tools() in-process.
+
+    This avoids spawning subprocesses and works regardless of sandbox availability.
+
+    Returns:
+        Tuple of (tools, tools_by_server) where:
+        - tools: list of MCP-format tool dicts {name, description, inputSchema}
+        - tools_by_server: dict mapping server_name → list of tool names
+    """
+    tools: list[dict] = []
+    tools_by_server: dict[str, list[str]] = {}
+    for server_name, module_name in _MANAGED_SERVER_MODULES.items():
+        try:
+            module = importlib.import_module(module_name)
+            server_tools = module._list_tools()
+            if isinstance(server_tools, list):
+                server_tool_names = []
+                for t in server_tools:
+                    if isinstance(t, dict) and t.get("name"):
+                        tools.append(t)
+                        server_tool_names.append(t["name"])
+                tools_by_server[server_name] = server_tool_names
+                logger.debug(
+                    "Discovered %d tools from %s", len(server_tools), server_name
+                )
+        except Exception as exc:
+            logger.debug("Failed to discover tools from %s: %s", server_name, exc)
+    return tools, tools_by_server
+
+
+# ── Non-managed server discovery (via mcp_discovery) ─────────────────────────
+
+async def _discover_external_tools() -> list[dict]:
+    """Discover tools from non-managed MCP servers via mcp_discovery.
+
+    Uses mcp_discovery.list_servers() to find configured servers, then spawns
+    each one and sends tools/list to get full schemas.
+
+    Returns list of MCP-format tool dicts: {name, description, inputSchema}.
+    """
+    try:
+        from kiro_crew.mcp_discovery import list_servers
+    except ImportError:
+        return []
+
+    servers = list_servers()
+    tools: list[dict] = []
+
+    for server in servers:
+        # Skip managed servers (handled by _discover_managed_tools)
+        if server.name in _MANAGED_SERVER_MODULES:
+            continue
+        # Skip disabled servers
+        if server.disabled:
+            continue
+        # Skip servers without a command
+        if not server.command:
+            continue
+
+        try:
+            server_tools = await _probe_server_tools(server)
+            tools.extend(server_tools)
+        except Exception as exc:
+            logger.debug("Failed to discover tools from %s: %s", server.name, exc)
+
+    return tools
+
+
+async def _probe_server_tools(server) -> list[dict]:
+    """Spawn an MCP server and get its full tool definitions via tools/list.
+
+    Returns list of MCP-format tool dicts: {name, description, inputSchema}.
+    """
+    # Resolve command
+    resolved = shutil.which(server.command)
+    if not resolved:
+        return []
+
+    proc = None
+    try:
+        # Spawn the server
+        proc = await asyncio.create_subprocess_exec(
+            resolved, *(server.args or []),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Send initialize request
+        init_req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "openai-provider", "version": "1.0"},
+            },
+        }) + "\n"
+        proc.stdin.write(init_req.encode())
+        await proc.stdin.drain()
+
+        # Read initialize response
+        resp_line = await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
+        if not resp_line:
+            return []
+
+        # Send initialized notification
+        notif = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }) + "\n"
+        proc.stdin.write(notif.encode())
+        await proc.stdin.drain()
+
+        # Send tools/list request
+        list_req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }) + "\n"
+        proc.stdin.write(list_req.encode())
+        await proc.stdin.drain()
+
+        # Read tools/list response
+        resp_line = await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
+        if not resp_line:
+            return []
+
+        resp = json.loads(resp_line)
+        result = resp.get("result", {})
+        tools_data = result.get("tools", [])
+
+        return [t for t in tools_data if isinstance(t, dict) and t.get("name")]
+
+    except Exception as exc:
+        logger.debug("MCP probe for %s failed: %s", server.name, exc)
+        return []
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+# ── MCP tool execution via stdio protocol ────────────────────────────────────
+
+# Cache of server command info for tool → server mapping
+_tool_server_map: dict[str, str] = {}  # tool_name → server_name
+_server_info: dict[str, dict] = {}  # server_name → {command, args, env}
+
+
+def _build_tool_server_map(tools_by_server: dict[str, list[str]] | None = None) -> None:
+    """Build mapping from tool names to server names.
+
+    Args:
+        tools_by_server: Optional dict mapping server_name → list of tool names.
+            If provided, uses this directly. Otherwise, uses mcp_discovery.
+    """
+    try:
+        from kiro_crew.mcp_discovery import list_servers
+        for server in list_servers():
+            if server.disabled or not server.command:
+                continue
+            _server_info[server.name] = {
+                "command": server.command,
+                "args": server.args or [],
+            }
+            # Map tool names to server names
+            if tools_by_server and server.name in tools_by_server:
+                for tool_name in tools_by_server[server.name]:
+                    _tool_server_map[tool_name] = server.name
+            elif hasattr(server, 'tools') and server.tools:
+                for tool_name in server.tools:
+                    if isinstance(tool_name, str):
+                        _tool_server_map[tool_name] = server.name
+    except ImportError:
+        pass
+
+
+async def _execute_via_mcp_stdio(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+) -> str | None:
+    """Execute a tool by spawning its MCP server and calling tools/call.
+
+    Returns the tool result string, or None if execution failed.
+    """
+    info = _server_info.get(server_name)
+    if not info:
+        return None
+
+    resolved = shutil.which(info["command"])
+    if not resolved:
+        return None
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            resolved, *info["args"],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Initialize
+        init_req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "openai-provider", "version": "1.0"},
+            },
+        }) + "\n"
+        proc.stdin.write(init_req.encode())
+        await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
+
+        # Initialized notification
+        notif = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }) + "\n"
+        proc.stdin.write(notif.encode())
+        await proc.stdin.drain()
+
+        # tools/call
+        call_req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": args,
+            },
+        }) + "\n"
+        proc.stdin.write(call_req.encode())
+        await proc.stdin.drain()
+
+        # Read response
+        resp_line = await asyncio.wait_for(proc.stdout.readline(), timeout=30.0)
+        if not resp_line:
+            return None
+
+        resp = json.loads(resp_line)
+        if resp.get("error"):
+            err = resp["error"]
+            return f"[MCP error: {err.get('message', str(err))}]"
+
+        result = resp.get("result", {})
+        content = result.get("content", [])
+        parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+        return "\n".join(parts) if parts else json.dumps(result)
+
+    except Exception as exc:
+        logger.debug("MCP stdio execution of %s/%s failed: %s", server_name, tool_name, exc)
+        return None
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+# ── MCP tool format conversion ───────────────────────────────────────────────
 
 def _mcp_tool_to_openai(tool: dict) -> dict:
     """Convert an MCP tool definition to OpenAI function-calling format."""
@@ -47,17 +341,27 @@ def _mcp_tool_to_openai(tool: dict) -> dict:
     }
 
 
+# ── McpToolExecutor ──────────────────────────────────────────────────────────
+
 class McpToolExecutor(ToolExecutor):
     """Executor that exposes KiroCrew MCP tools to the OpenAI model.
 
-    Reads available tools from the MCP gateway's shared server pool (if enabled)
-    or from the per-session MCP clients. Falls back gracefully if MCP is
-    unavailable.
+    Discovery:
+      - Managed servers (kirocrew-core, kirocrew-cron, kirocrew-computer):
+        in-process _list_tools() — no subprocess, no sandbox needed
+      - Non-managed servers: mcp_discovery.list_servers() → spawn → tools/list
+      - Local handlers: Python reimplementations of kiro-cli built-in tools
+
+    Execution:
+      1. Local registry handler (O(1) dict lookup)
+      2. MCP stdio protocol (spawn server → tools/call)
+      3. Error with available-tools hint
     """
 
     def __init__(self) -> None:
         self._tools_cache: list[dict] | None = None
         self._definitions_cache: list[dict] | None = None
+        self._mcp_tool_names: set[str] = set()  # tools from MCP servers
         self._lock = asyncio.Lock()
 
     # ── Tool discovery ────────────────────────────────────────────────────────
@@ -66,11 +370,9 @@ class McpToolExecutor(ToolExecutor):
         """Return OpenAI tool definitions (sync — uses cached value)."""
         if self._definitions_cache is not None:
             return self._definitions_cache
-        # Sync fetch on first call (blocking but one-time)
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Can't block — return empty and populate on next async call
                 asyncio.ensure_future(self._fetch_tools_async())
                 return []
             else:
@@ -80,656 +382,125 @@ class McpToolExecutor(ToolExecutor):
             return []
 
     async def _fetch_tools_async(self) -> None:
-        """Populate tools cache by querying installed MCP servers."""
+        """Populate tools cache by discovering from MCP servers + local handlers."""
         async with self._lock:
             if self._definitions_cache is not None:
                 return
-            tools: list[dict] = []
+
+            # Ensure local handlers are registered
+            from .mcp_handler_registry import McpHandlerRegistry, register_all_builtins
+            if not McpHandlerRegistry._handlers:
+                register_all_builtins()
+
+            # Discover tools from managed servers (in-process, no spawn)
+            managed_tools, managed_tools_by_server = _discover_managed_tools()
+
+            # Discover tools from non-managed servers (spawn + MCP protocol)
+            external_tools: list[dict] = []
             try:
-                tools = await _list_mcp_tools()
+                external_tools = await _discover_external_tools()
             except Exception as exc:
-                logger.warning("McpToolExecutor: could not list MCP tools: %s", exc)
-                tools = []
+                logger.warning("External MCP discovery failed: %s", exc)
 
-            # Always merge in built-in tool definitions (MCP servers may not
-            # expose file/web tools that kiro-cli normally provides)
-            builtin = _builtin_tool_definitions()
-            builtin_names = {t["name"] for t in builtin}
-            # MCP tools take priority; only add built-ins not already present
-            mcp_names = {t["name"] for t in tools}
-            for bt in builtin:
-                if bt["name"] not in mcp_names:
-                    tools.append(bt)
+            # Build tool → server mapping for execution
+            _build_tool_server_map(tools_by_server=managed_tools_by_server)
 
-            self._tools_cache = tools
-            self._definitions_cache = [_mcp_tool_to_openai(t) for t in tools]
+            # Track MCP tool names (for execution routing)
+            all_mcp_tools = managed_tools + external_tools
+            self._mcp_tool_names = {t["name"] for t in all_mcp_tools}
+
+            # Merge: local handlers take priority, then MCP tools
+            local_names = set(McpHandlerRegistry._handlers.keys())
+            all_tools: list[dict] = []
+
+            # Add local handler definitions (in MCP format)
+            for name in sorted(local_names):
+                defn = McpHandlerRegistry.definition_for(name)
+                if defn:
+                    fn = defn.get("function", {})
+                    all_tools.append({
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "inputSchema": fn.get("parameters", {"type": "object", "properties": {}}),
+                    })
+
+            # Add MCP tools not already in local registry
+            for tool in all_mcp_tools:
+                if tool["name"] not in local_names:
+                    all_tools.append(tool)
+
+            self._tools_cache = all_tools
+            self._definitions_cache = [_mcp_tool_to_openai(t) for t in all_tools]
             logger.info(
-                "McpToolExecutor: loaded %d tool definitions (%d MCP + %d built-in)",
+                "McpToolExecutor: loaded %d tools (%d local + %d managed MCP + %d external MCP)",
                 len(self._definitions_cache),
-                len(tools) - len(builtin) + len(builtin_names & mcp_names),
-                len(builtin_names - mcp_names),
+                len(local_names),
+                len(managed_tools),
+                len(external_tools),
             )
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
     async def execute(self, name: str, args: dict) -> Any:
         """Execute a tool by name with given args, return string result."""
-        # Ensure tools are loaded
         if self._definitions_cache is None:
             await self._fetch_tools_async()
 
         try:
-            result = await _call_mcp_tool(name, args)
+            result = await _call_tool(name, args, self._mcp_tool_names)
             return result
         except Exception as exc:
             logger.exception("McpToolExecutor: tool %s failed", name)
             return f"[Tool execution error: {exc}]"
 
 
-# ── MCP client helpers ────────────────────────────────────────────────────────
+# ── Tool execution dispatch ──────────────────────────────────────────────────
 
-async def _list_mcp_tools() -> list[dict]:
-    """List tools from the MCP gateway or installed servers."""
-    # Try the shared gateway first
-    try:
-        from kiro_crew.mcp_gateway.session_servers import get_pooled_servers
-        servers = get_pooled_servers()
-        tools = []
-        for server in servers.values():
-            try:
-                resp = await server.list_tools()
-                tools.extend(resp.get("tools", []))
-            except Exception:
-                pass
-        if tools:
-            return tools
-    except ImportError:
-        pass
-
-    # Fallback: spawn a minimal MCP client and list managed servers
-    try:
-        from kiro_crew.mcp_providers.official import OfficialMcpProvider
-        provider = OfficialMcpProvider()
-        tools = await provider.list_tools()
-        return tools
-    except Exception:
-        pass
-
-    return []
-
-
-async def _call_mcp_tool(name: str, args: dict) -> str:
-    """Call a tool via MCP and return the text result.
+async def _call_tool(
+    name: str,
+    args: dict,
+    mcp_tool_names: set[str],
+) -> str:
+    """Dispatch a tool call.
 
     Routing order:
-      1. MCP gateway (pooled servers)
-      2. Built-in tool handlers (file I/O, web, shell)
+      1. Local registry handler (direct, zero-latency)
+      2. MCP stdio protocol (spawn server → tools/call)
+      3. Error with available-tools hint
     """
-    # Try gateway first
-    try:
-        from kiro_crew.mcp_gateway.session_servers import get_pooled_servers
-        servers = get_pooled_servers()
-        for server in servers.values():
-            try:
-                resp = await server.call_tool(name, args)
-                content = resp.get("content", [])
-                parts = []
-                for block in content:
-                    if block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                return "\n".join(parts) if parts else json.dumps(resp)
-            except Exception:
-                continue
-    except ImportError:
-        pass
+    from .mcp_handler_registry import McpHandlerRegistry
 
-    # ── Built-in tool handlers ────────────────────────────────────────────────
-    # These reimplement kiro-cli's built-in tools in Python for the OpenAI
-    # provider path (kiro-cli is bypassed when using gateway.py).
-
-    if name in ("execute_bash", "shell", "bash"):
-        cmd = args.get("command", "")
-        if cmd:
-            return await _run_bash(cmd)
-
-    if name == "read":
-        return await _tool_read(args)
-
-    if name in ("write", "create_file"):
-        return await _tool_write(args)
-
-    if name == "edit":
-        return await _tool_edit(args)
-
-    if name == "grep":
-        return await _tool_grep(args)
-
-    if name == "glob":
-        return await _tool_glob(args)
-
-    if name == "find":
-        return await _tool_find(args)
-
-    if name == "list_dir":
-        return await _tool_list_dir(args)
-
-    if name == "web_fetch":
-        return await _tool_web_fetch(args)
-
-    if name == "web_search":
-        return await _tool_web_search(args)
-
-    raise RuntimeError(f"No MCP server found for tool: {name}")
-
-
-# ── Built-in tool implementations ─────────────────────────────────────────────
-# These mirror kiro-cli's built-in tools for the OpenAI provider path.
-
-async def _tool_read(args: dict) -> str:
-    """Read file contents. Mirrors kiro-cli's 'read' tool.
-
-    Args:
-        filePath or path: file path to read
-        offset: optional start line (1-based)
-        limit: optional max lines to read
-    """
-    file_path = args.get("filePath") or args.get("path", "")
-    if not file_path:
-        return "[Error: filePath or path is required]"
-
-    p = Path(file_path).expanduser()
-    if not p.exists():
-        return f"[Error: file not found: {p}]"
-    if p.is_dir():
-        return f"[Error: {p} is a directory, not a file. Use list_dir instead.]"
-
-    try:
-        content = p.read_text(errors="replace")
-    except Exception as exc:
-        return f"[Error reading {p}: {exc}]"
-
-    lines = content.splitlines(keepends=True)
-    offset = args.get("offset")
-    limit = args.get("limit")
-
-    if offset is not None:
+    # 1. Try local registry handler
+    handler = McpHandlerRegistry.get(name)
+    if handler is not None:
         try:
-            offset = int(offset) - 1  # 1-based to 0-based
-            if offset < 0:
-                offset = 0
-        except (ValueError, TypeError):
-            offset = 0
+            return await handler.execute(args)
+        except Exception as exc:
+            logger.exception("Handler %r failed", name)
+            return f"[Tool execution error: {exc}]"
 
-    if limit is not None:
-        try:
-            limit = int(limit)
-        except (ValueError, TypeError):
-            limit = None
+    # 2. Try MCP stdio (for tools discovered from MCP servers)
+    if name in mcp_tool_names:
+        # Find which server hosts this tool
+        server_name = _tool_server_map.get(name)
+        if server_name:
+            result = await _execute_via_mcp_stdio(server_name, name, args)
+            if result is not None:
+                return result
 
-    start = offset if offset else 0
-    if limit:
-        lines = lines[start:start + limit]
-    else:
-        lines = lines[start:]
+        # Fallback: try all known servers
+        for srv_name in _server_info:
+            result = await _execute_via_mcp_stdio(srv_name, name, args)
+            if result is not None:
+                return result
 
-    # Add line numbers like kiro-cli does
-    numbered = []
-    for i, line in enumerate(lines, start=start + 1):
-        numbered.append(f"{i:>6}\t{line.rstrip()}")
+        logger.warning("MCP tool %r found in discovery but execution failed", name)
 
-    result = "\n".join(numbered)
-    if not result:
-        return "[empty file]"
-    return result
-
-
-async def _tool_write(args: dict) -> str:
-    """Write content to a file. Mirrors kiro-cli's 'write' tool.
-
-    Args:
-        filePath or path: target file path
-        content: content to write
-    """
-    file_path = args.get("filePath") or args.get("path", "")
-    content = args.get("content", "")
-
-    if not file_path:
-        return "[Error: filePath or path is required]"
-
-    p = Path(file_path).expanduser()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        return f"[Wrote {len(content)} bytes to {p}]"
-    except Exception as exc:
-        return f"[Error writing {p}: {exc}]"
-
-
-async def _tool_edit(args: dict) -> str:
-    """Replace text in a file. Mirrors kiro-cli's 'edit' tool.
-
-    Args:
-        filePath or path: target file path
-        oldString: text to find (exact match)
-        newString: replacement text
-       replaceAll: optional, replace all occurrences (default: false)
-    """
-    file_path = args.get("filePath") or args.get("path", "")
-    old_string = args.get("oldString") or args.get("old_string", "")
-    new_string = args.get("newString") or args.get("new_string", "")
-    replace_all = args.get("replaceAll") or args.get("replace_all", False)
-
-    if not file_path:
-        return "[Error: filePath or path is required]"
-    if not old_string:
-        return "[Error: oldString is required]"
-
-    p = Path(file_path).expanduser()
-    if not p.exists():
-        return f"[Error: file not found: {p}]"
-
-    try:
-        content = p.read_text(errors="replace")
-    except Exception as exc:
-        return f"[Error reading {p}: {exc}]"
-
-    count = content.count(old_string)
-    if count == 0:
-        return f"[Error: oldString not found in {p}]"
-
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
-        p.write_text(new_content)
-        return f"[Replaced {count} occurrence(s) in {p}]"
-    else:
-        if count > 1:
-            return (
-                f"[Error: oldString found {count} times in {p}. "
-                f"Provide more context to make it unique, or set replaceAll=true.]"
-            )
-        new_content = content.replace(old_string, new_string, 1)
-        p.write_text(new_content)
-        return f"[Replaced 1 occurrence in {p}]"
-
-
-async def _tool_grep(args: dict) -> str:
-    """Search for a pattern in files. Mirrors kiro-cli's 'grep' tool.
-
-    Args:
-        pattern: search pattern (regex)
-        path or directory: directory to search in (default: cwd)
-        include: optional glob filter (e.g. "*.py")
-        exclude: optional glob exclusion
-    """
-    pattern = args.get("pattern", "")
-    directory = args.get("path") or args.get("directory") or args.get("cwd", ".")
-    include = args.get("include", "")
-    exclude = args.get("exclude", "")
-
-    if not pattern:
-        return "[Error: pattern is required]"
-
-    # Use ripgrep if available, fall back to grep
-    rg_path = subprocess.run(["which", "rg"], capture_output=True, text=True).stdout.strip()
-    if rg_path:
-        cmd = ["rg", "--no-heading", "-n", "--max-count", "50"]
-        if include:
-            cmd.extend(["-g", include])
-        if exclude:
-            cmd.extend(["-g", f"!{exclude}"])
-        cmd.extend([pattern, directory])
-    else:
-        cmd = ["grep", "-rn", "--max-count=50"]
-        if include:
-            cmd.extend(["--include", include])
-        if exclude:
-            cmd.extend(["--exclude", exclude])
-        cmd.extend([pattern, directory])
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        output = stdout.decode(errors="replace").strip()
-        if proc.returncode == 1:
-            return f"[No matches for '{pattern}']"
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            return f"[grep error: {err}]"
-        # Limit output to prevent context flood
-        if len(output) > 30000:
-            lines = output.splitlines()
-            output = "\n".join(lines[:500]) + f"\n... (truncated, {len(lines)} total matches)"
-        return output or f"[No matches for '{pattern}']"
-    except asyncio.TimeoutError:
-        return "[Error: grep timed out (15s)]"
-    except Exception as exc:
-        return f"[Error running grep: {exc}]"
-
-
-async def _tool_glob(args: dict) -> str:
-    """Find files matching a glob pattern. Mirrors kiro-cli's 'glob' tool.
-
-    Args:
-        pattern: glob pattern (e.g. "**/*.py")
-        path: optional base directory (default: cwd)
-    """
-    pattern = args.get("pattern", "")
-    base = args.get("path") or args.get("directory") or "."
-
-    if not pattern:
-        return "[Error: pattern is required]"
-
-    base_path = Path(base).expanduser()
-    if not base_path.exists():
-        return f"[Error: directory not found: {base_path}]"
-
-    full_pattern = str(base_path / pattern)
-    try:
-        matches = sorted(_glob_mod.glob(full_pattern, recursive=True))
-        if not matches:
-            return f"[No files matching '{pattern}' in {base}]"
-        # Limit results
-        if len(matches) > 200:
-            result = "\n".join(matches[:200]) + f"\n... ({len(matches)} total, showing first 200)"
-        else:
-            result = "\n".join(matches)
-        return result
-    except Exception as exc:
-        return f"[Error running glob: {exc}]"
-
-
-async def _tool_find(args: dict) -> str:
-    """Find files by name or type. Mirrors kiro-cli's 'find' tool.
-
-    Args:
-        name: filename pattern (e.g. "*.py")
-        path: directory to search in (default: cwd)
-        type: "f" for files, "d" for directories
-    """
-    name_pattern = args.get("name", "")
-    search_path = args.get("path") or args.get("directory") or "."
-    file_type = args.get("type", "")
-
-    cmd = ["find", search_path, "-maxdepth", "5"]
-    if name_pattern:
-        cmd.extend(["-name", name_pattern])
-    if file_type in ("f", "d"):
-        cmd.extend(["-type", file_type])
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        output = stdout.decode(errors="replace").strip()
-        if not output:
-            return "[No results found]"
-        lines = output.splitlines()
-        if len(lines) > 200:
-            return "\n".join(lines[:200]) + f"\n... ({len(lines)} total, showing first 200)"
-        return output
-    except asyncio.TimeoutError:
-        return "[Error: find timed out (15s)]"
-    except Exception as exc:
-        return f"[Error running find: {exc}]"
-
-
-async def _tool_list_dir(args: dict) -> str:
-    """List directory contents. Mirrors kiro-cli's 'list_dir' tool.
-
-    Args:
-        path: directory path to list (default: cwd)
-    """
-    dir_path = args.get("path") or args.get("directory") or "."
-    p = Path(dir_path).expanduser()
-
-    if not p.exists():
-        return f"[Error: path not found: {p}]"
-    if not p.is_dir():
-        return f"[Error: {p} is not a directory]"
-
-    try:
-        entries = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-        lines = []
-        for entry in entries:
-            if entry.is_dir():
-                lines.append(f"DIR  {entry.name}/")
-            else:
-                size = entry.stat().st_size
-                if size < 1024:
-                    size_str = f"{size}B"
-                elif size < 1024 * 1024:
-                    size_str = f"{size / 1024:.1f}KB"
-                else:
-                    size_str = f"{size / (1024 * 1024):.1f}MB"
-                lines.append(f"FILE {entry.name}  ({size_str})")
-        return "\n".join(lines) or "[empty directory]"
-    except Exception as exc:
-        return f"[Error listing {p}: {exc}]"
-
-
-async def _tool_web_fetch(args: dict) -> str:
-    """Fetch content from a URL. Mirrors kiro-cli's 'web_fetch' tool.
-
-    Args:
-        url: URL to fetch
-        maxLength: optional max response length (default: 50000)
-    """
-    url = args.get("url", "")
-    if not url:
-        return "[Error: url is required]"
-
-    max_length = args.get("maxLength") or args.get("max_length") or 50000
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-sL", "-A", "Mozilla/5.0 (KiroCrew/1.0)",
-            "--max-time", "30", "-o", "-", url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35.0)
-
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            return f"[Error fetching {url}: {err}]"
-
-        content = stdout.decode(errors="replace")
-        if len(content) > max_length:
-            content = content[:max_length] + f"\n\n... (truncated at {max_length} chars)"
-        return content
-    except asyncio.TimeoutError:
-        return f"[Error: fetch timed out for {url}]"
-    except Exception as exc:
-        return f"[Error fetching {url}: {exc}]"
-
-
-async def _tool_web_search(args: dict) -> str:
-    """Search the web. Returns a note that web search is not available.
-
-    Args:
-        query: search query
-    """
-    query = args.get("query", "")
-    return (
-        f"[Web search is not available in this environment. "
-        f"Query was: '{query}'. Use web_fetch to fetch specific URLs instead.]"
+    # 3. No handler found
+    available = ", ".join(sorted(McpHandlerRegistry._handlers.keys()))
+    other_mcp = mcp_tool_names - set(McpHandlerRegistry._handlers.keys())
+    if other_mcp:
+        available += ", " + ", ".join(sorted(other_mcp))
+    raise RuntimeError(
+        f"No handler found for tool: {name}. Available: {available}"
     )
-
-
-# ── Shell execution ───────────────────────────────────────────────────────────
-
-async def _run_bash(command: str) -> str:
-    """Execute a shell command (fallback for bash tools)."""
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-    out = stdout.decode(errors="replace")
-    err = stderr.decode(errors="replace")
-    result = out
-    if err:
-        result += f"\n[stderr]\n{err}"
-    if proc.returncode and proc.returncode != 0:
-        result += f"\n[exit code: {proc.returncode}]"
-    return result
-
-
-# ── Built-in tool definitions (fallback when MCP is unavailable) ──────────────
-
-def _builtin_tool_definitions() -> list[dict]:
-    """Built-in tool set — reimplements kiro-cli's built-in tools for the
-    OpenAI provider path where kiro-cli is bypassed."""
-    return [
-        {
-            "name": "execute_bash",
-            "description": "Run a shell command and return its output.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command to run"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["command"],
-            },
-        },
-        {
-            "name": "read",
-            "description": (
-                "Read the contents of a file. Returns file content with line numbers. "
-                "Use offset/limit for large files."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filePath": {"type": "string", "description": "Absolute path to the file"},
-                    "path": {"type": "string", "description": "Alternative: file path"},
-                    "offset": {"type": "integer", "description": "Start line (1-based)"},
-                    "limit": {"type": "integer", "description": "Max lines to read"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["filePath"],
-            },
-        },
-        {
-            "name": "write",
-            "description": "Write content to a file, creating directories if needed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filePath": {"type": "string", "description": "Target file path"},
-                    "path": {"type": "string", "description": "Alternative: file path"},
-                    "content": {"type": "string", "description": "Content to write"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["filePath", "content"],
-            },
-        },
-        {
-            "name": "edit",
-            "description": (
-                "Replace text in a file. oldString must exactly match text in the file. "
-                "Fails if multiple matches found unless replaceAll is true."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filePath": {"type": "string", "description": "Target file path"},
-                    "path": {"type": "string", "description": "Alternative: file path"},
-                    "oldString": {"type": "string", "description": "Text to find"},
-                    "newString": {"type": "string", "description": "Replacement text"},
-                    "replaceAll": {"type": "boolean", "description": "Replace all occurrences"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["filePath", "oldString", "newString"],
-            },
-        },
-        {
-            "name": "grep",
-            "description": "Search for a regex pattern in files. Returns matching lines with filenames and line numbers.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
-                    "path": {"type": "string", "description": "Directory to search in"},
-                    "directory": {"type": "string", "description": "Alternative: directory path"},
-                    "include": {"type": "string", "description": "Glob filter (e.g. *.py)"},
-                    "exclude": {"type": "string", "description": "Glob exclusion"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["pattern"],
-            },
-        },
-        {
-            "name": "glob",
-            "description": "Find files matching a glob pattern (e.g. '**/*.py').",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern"},
-                    "path": {"type": "string", "description": "Base directory (default: cwd)"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["pattern"],
-            },
-        },
-        {
-            "name": "find",
-            "description": "Find files by name or type in a directory tree.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Filename pattern (e.g. *.py)"},
-                    "path": {"type": "string", "description": "Directory to search in"},
-                    "type": {"type": "string", "description": "File type: f=file, d=directory"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "list_dir",
-            "description": "List files and directories at the given path with sizes.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path to list"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "web_fetch",
-            "description": "Fetch content from a URL via HTTP GET.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"},
-                    "maxLength": {"type": "integer", "description": "Max response chars (default: 50000)"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["url"],
-            },
-        },
-        {
-            "name": "web_search",
-            "description": "Search the web for information.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "__tool_use_purpose": {"type": "string"},
-                },
-                "required": ["query"],
-            },
-        },
-    ]
