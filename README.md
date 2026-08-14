@@ -117,7 +117,7 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | Knowledge extraction | ✅ | `OpenAIWorker` — non-streaming HTTP, no subprocess |
 | Context compaction | ✅ | Auto-summarizes old messages when context fills up |
 | Remote embedding backend | ✅ | Replaces bundled llama.cpp — saves ~610 MB RAM + 0% CPU |
-| MCP tool routing | ⚠️ | Best-effort via `McpToolExecutor` |
+| MCP tool routing | ✅ | Registry-based dispatch: 13 local handlers + 115 dynamic MCP tools |
 
 ## Architecture
 
@@ -160,6 +160,33 @@ This eliminates:
 - **~189% CPU** (no local matrix multiplication on 2-core ARM)
 
 Configure via `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`. If the remote endpoint is unreachable, embedding returns `None` and KiroCrew falls back to keyword/FTS search.
+
+### MCP Tool Routing
+
+The OpenAI provider exposes all KiroCrew MCP tools to the model via a two-layer dispatch system:
+
+```
+OpenAI Model
+  → McpToolExecutor.execute(name, args)
+    ├── 1. Local Registry (13 handlers, O(1), zero-latency)
+    │     read, write, edit, grep, glob, find, list_dir,
+    │     execute_bash, web_fetch, web_search,
+    │     ask_question, spawn_run, spawn_list
+    │
+    └── 2. MCP Stdio Protocol (115 tools from managed servers)
+          kirocrew-core (65): learn_add, cron_*, task_run, wait, ...
+          kirocrew-cron  (8): cron_add, cron_list, cron_update, ...
+          kirocrew-computer:  disabled (macOS only)
+```
+
+**Discovery** happens at startup without spawning subprocesses: managed server modules (`kiro_crew.mcp_core`, `kiro_crew.mcp_cron`) are imported in-process and their `_list_tools()` functions return full tool schemas. Non-managed servers (e.g. `playwright-mcp`) are discovered via `mcp_discovery.list_servers()` with MCP protocol probing.
+
+**Execution** has three tiers:
+1. **Local registry** — Python reimplementation of kiro-cli's built-in tools, plus gateway-proxied handlers for `ask_question` (session_directive) and `spawn_run`/`spawn_list` (HTTP to gateway API)
+2. **MCP stdio** — spawns the target server as a subprocess, sends `tools/call` via JSON-RPC, parses result
+3. **Error with hint** — lists all available tools when a tool is not found
+
+Adding new local handlers requires only subclassing `McpHandler` and calling `McpHandlerRegistry.register()` — no existing code needs modification (Open/Closed Principle).
 
 ### Code Review Sage
 
@@ -231,7 +258,8 @@ KiroCrew-OpenAI-Compatible/
     ├── provider.py              # OpenAIProvider (LLMProvider implementation)
     ├── install.py               # Monkey-patches KiroCrew ProviderRegistry + LLMPool
     ├── embedding_backend.py     # OpenAIEmbeddingBackend (replaces bundled llama.cpp)
-    ├── mcp_executor.py          # Bridges tool calls → KiroCrew MCP servers
+    ├── mcp_executor.py          # McpToolExecutor — bridges tool calls → MCP dispatch
+    ├── mcp_handler_registry.py  # Registry-based MCP handler system (13 local handlers)
     ├── openai_worker.py         # OpenAIWorker for knowledge extraction
     ├── test_openai_worker.py    # Tests for OpenAIWorker + shared config
     └── test_tools.py            # Tests for MCP tool execution
@@ -263,6 +291,8 @@ install(tool_executor=MyExecutor())
 2. **Multimodal**: Image attachments are not passed through to vision-capable APIs yet.
 
 3. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
+
+4. **MCP stdio overhead**: Non-local tools (cron_add, learn_add, etc.) spawn a subprocess per call (~200-500ms). Acceptable for infrequent calls; local handlers have zero overhead.
 
 ## Contributing
 
