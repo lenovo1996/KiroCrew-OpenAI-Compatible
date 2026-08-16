@@ -53,7 +53,7 @@ The provider is installed by monkey-patching `ProviderRegistry.create_factory` a
 ### Install Dependencies
 
 ```bash
-pip install httpx
+pip install httpx ddgs
 ```
 
 ### Run the Gateway
@@ -117,6 +117,8 @@ The dashboard works identically — memory, cron, subagents, knowledge library, 
 | Knowledge extraction | ✅ | `OpenAIWorker` — non-streaming HTTP, no subprocess |
 | Context compaction | ✅ | Auto-summarizes old messages when context fills up |
 | Remote embedding backend | ✅ | Replaces bundled llama.cpp — saves ~610 MB RAM + 0% CPU |
+| Background session routing | ✅ | Auto-title/link-summary use OpenAI (Patch 5) |
+| Web search | ✅ | DuckDuckGo via `ddgs` — titles, URLs, snippets |
 | MCP tool routing | ✅ | Registry-based dispatch: 13 local handlers + 115 dynamic MCP tools |
 
 ## Architecture
@@ -160,6 +162,19 @@ This eliminates:
 - **~189% CPU** (no local matrix multiplication on 2-core ARM)
 
 Configure via `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`. If the remote endpoint is unreachable, embedding returns `None` and KiroCrew falls back to keyword/FTS search.
+
+### Background Session Path
+
+KiroCrew runs lightweight background LLM calls for auto-title generation and nav bar link summary resolution. Without Patch 5, those calls route through `SessionManager._bg_provider_is_kiro()` → `AcpSessionHandle` → kiro-cli → Anthropic API, **bypassing** all openai_provider patches. This caused `AcpError: The monthly usage limit has been reached` errors (100+ per day) when the Anthropic quota was exhausted.
+
+```
+run_bg_oneliner()
+  → sessions.get_bg_session()
+    → SessionManager._bg_provider_is_kiro()  ← patched to return False
+      → _ensure_background()
+        → OpenAIProvider (via patched factory)
+          → 9router → free model endpoint
+```
 
 ### MCP Tool Routing
 
@@ -256,7 +271,7 @@ KiroCrew-OpenAI-Compatible/
     ├── __init__.py              # Public API: install()
     ├── _config.py               # Shared config, env vars, known model map
     ├── provider.py              # OpenAIProvider (LLMProvider implementation)
-    ├── install.py               # Monkey-patches KiroCrew ProviderRegistry + LLMPool
+    ├── install.py               # Monkey-patches KiroCrew (5 patches: factory, config, pool, embed, bg)
     ├── embedding_backend.py     # OpenAIEmbeddingBackend (replaces bundled llama.cpp)
     ├── mcp_executor.py          # McpToolExecutor — bridges tool calls → MCP dispatch
     ├── mcp_handler_registry.py  # Registry-based MCP handler system (13 local handlers)
@@ -292,7 +307,9 @@ install(tool_executor=MyExecutor())
 
 3. **Code review sage**: Uses `AcpRuntime` directly (requires tool execution via kiro-cli). Not covered by this provider — continues to use the default Claude backend.
 
-4. **MCP stdio overhead**: Non-local tools (cron_add, learn_add, etc.) spawn a subprocess per call (~200-500ms). Acceptable for infrequent calls; local handlers have zero overhead.
+4. **Web search dependency**: The `web_search` handler requires the `ddgs` package (`pip install ddgs`). Falls back to `duckduckgo_search` if unavailable.
+
+5. **MCP stdio overhead**: Non-local tools (cron_add, learn_add, etc.) spawn a subprocess per call (~200-500ms). Acceptable for infrequent calls; local handlers have zero overhead.
 
 ## Contributing
 

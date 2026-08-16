@@ -287,10 +287,50 @@ class WebSearchHandler(McpHandler):
     def name(self) -> str: return "web_search"
 
     def definition(self) -> dict:
-        return {"type": "function", "function": {"name": "web_search", "description": "Search the web for information.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "__tool_use_purpose": {"type": "string"}}, "required": ["query"]}}}
+        return {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for information using DuckDuckGo. Returns titles, URLs, and snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query string"},
+                        "max_results": {"type": "integer", "description": "Max results (1-10, default 5)", "default": 5},
+                        "__tool_use_purpose": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
 
     async def execute(self, args: dict) -> str:
-        return f"[Web search not available. Query: '{args.get('query', '')}'. Use web_fetch for specific URLs.]"
+        query = args.get("query", "")
+        max_results = min(args.get("max_results", 5), 10)
+        if not query:
+            return "[Error: No query provided]"
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(None, self._search, query, max_results)
+            if not results:
+                return f"[No results found for: '{query}']"
+            lines = []
+            for i, r in enumerate(results, 1):
+                lines.append(f"{i}. **{r['title']}**\n   {r['href']}\n   {r['body']}")
+            return "\n\n".join(lines)
+        except Exception as e:
+            return f"[Search error: {e}]"
+
+    @staticmethod
+    def _search(query: str, max_results: int) -> list:
+        try:
+            from ddgs import DDGS
+            return DDGS().text(query, max_results=max_results)
+        except ImportError:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=max_results))
 
 
 # ── Gateway-proxied Handlers (ask_question, spawn_run, spawn_list) ───────────
