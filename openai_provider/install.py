@@ -152,6 +152,33 @@ def install(
             "openai_provider: embedding backend registration skipped: %s", exc
         )
 
+    # ── Patch 5: Background sessions (auto-title, link summary, etc.) ─────
+    # ``run_bg_oneliner`` (used by chat_title, chat_nav) calls
+    # ``sessions.get_bg_session()`` which checks ``_bg_provider_is_kiro()``.
+    # That method reads ``agent.provider`` from config.json — if it's "acp",
+    # bg sessions route to AcpSessionHandle → kiro-cli → Anthropic, bypassing
+    # our patched factory entirely.  Overriding it to return False makes
+    # ``get_bg_session`` fall through to ``_ensure_background()`` which
+    # creates a session via the (already-patched) provider factory →
+    # OpenAIProvider → 9router.  The ``_ProviderBgSession`` wrapper provides
+    # the same ``prompt()``/``reject_tool()``/``destroy()`` interface that
+    # ``run_bg_oneliner`` expects.
+    try:
+        from kiro_crew.session import SessionManager
+
+        def _bg_provider_is_not_kiro(self: Any) -> bool:
+            return False
+
+        SessionManager._bg_provider_is_kiro = _bg_provider_is_not_kiro  # type: ignore[method-assign]
+        logger.info(
+            "openai_provider: SessionManager._bg_provider_is_kiro patched → "
+            "bg sessions will use OpenAI factory ✅"
+        )
+    except Exception as exc:
+        logger.warning(
+            "openai_provider: bg session patch skipped: %s", exc
+        )
+
     _installed = True
     logger.info(
         "openai_provider installed — model=%s  base_url=%s",
