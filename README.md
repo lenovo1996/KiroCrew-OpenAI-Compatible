@@ -264,8 +264,16 @@ Any OpenAI-compatible `/v1/embeddings` endpoint works. The backend validates out
 KiroCrew-OpenAI-Compatible/
 ├── README.md
 ├── LICENSE
+├── CONTRIBUTING.md              # Contribution guidelines
+├── SECURITY.md                  # Security policy and reporting
+├── CODE_OF_CONDUCT.md           # Community code of conduct
 ├── .gitignore
-├── .env.example                  # Template for environment variables
+├── .env.example                 # Template for environment variables
+├── .github/
+│   ├── PULL_REQUEST_TEMPLATE.md # PR template
+│   └── ISSUE_TEMPLATE/
+│       ├── bug_report.md        # Bug report template
+│       └── feature_request.md   # Feature request template
 ├── gateway.py                   # Entry point — start KiroCrew with OpenAI provider
 └── openai_provider/             # Python package
     ├── __init__.py              # Public API: install()
@@ -313,11 +321,11 @@ install(tool_executor=MyExecutor())
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, code style, and the PR workflow.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-change`)
-3. Run the tests: `python -m unittest test_openai_worker test_tools -v`
+3. Run the tests: `python -m unittest openai_provider.test_openai_worker openai_provider.test_tools -v`
 4. Submit a pull request
 
 ## License
