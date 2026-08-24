@@ -405,20 +405,18 @@ def _internal_secret() -> str:
         return ""
 
 
-async def _gateway_post(path: str, body: dict) -> dict:
-    """POST to KiroCrew gateway loopback API."""
+def _gateway_post_sync(path: str, body: dict, secret: str, session_key: str, api: str) -> dict:
+    """Blocking POST to KiroCrew gateway loopback API. Runs in thread pool."""
     import urllib.request
     import urllib.error
 
-    api = _resolve_gateway_api()
     data = json.dumps(body).encode()
     headers = {
         "Content-Type": "application/json",
-        "X-Internal-Secret": _internal_secret(),
+        "X-Internal-Secret": secret,
     }
-    sk = _resolve_session_key()
-    if sk:
-        headers["X-Session-Key"] = sk
+    if session_key:
+        headers["X-Session-Key"] = session_key
 
     req = urllib.request.Request(f"{api}{path}", data=data, headers=headers, method="POST")
     try:
@@ -432,6 +430,16 @@ async def _gateway_post(path: str, body: dict) -> dict:
         return {"error": err}
     except Exception as e:
         return {"error": str(e)}
+
+
+async def _gateway_post(path: str, body: dict) -> dict:
+    """POST to KiroCrew gateway loopback API (non-blocking via thread pool)."""
+    import asyncio
+
+    api = _resolve_gateway_api()
+    secret = _internal_secret()
+    session_key = _resolve_session_key()
+    return await asyncio.to_thread(_gateway_post_sync, path, body, secret, session_key, api)
 
 
 # ── ask_question ─────────────────────────────────────────────────────────────
@@ -637,7 +645,11 @@ def register_all_builtins() -> None:
         WebFetchHandler(),
         WebSearchHandler(),
         # Gateway-proxied handlers
-        AskQuestionHandler(),
+        # NOTE: AskQuestionHandler is intentionally NOT registered here.
+        # ask_question must route through MCP stdio to kirocrew-core so that
+        # session_directive.encode() produces the correct sentinel format
+        # ([[KIROCREW_SESSION_DIRECTIVE]]) and the forgery gate in
+        # chat_runner.py can authenticate it via mcp_server_name.
         SpawnRunHandler(),
         SpawnListHandler(),
     )

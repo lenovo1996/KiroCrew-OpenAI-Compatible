@@ -738,6 +738,9 @@ class OpenAIProvider(LLMProvider):
 
         # Announce tool call to dashboard
         purpose = fn_args.pop("__tool_use_purpose", "") or fn_name
+        # Resolve MCP server name so chat_runner's forgery gate can
+        # authenticate directive tools (ask_question, monitor_start, etc.)
+        _mcp_server = self._tool_executor.server_name_for(fn_name)
         yield AcpEvent(
             kind=EVENT_TOOL_CALL,
             tool_call_id=tool_call_id,
@@ -745,6 +748,7 @@ class OpenAIProvider(LLMProvider):
             tool_name=fn_name,
             tool_purpose=purpose,
             tool_input=json.dumps(fn_args),
+            mcp_server_name=_mcp_server,
         )
 
         # Request permission from KiroCrew approval ladder
@@ -777,6 +781,7 @@ class OpenAIProvider(LLMProvider):
                 tool_call_id=tool_call_id,
                 tool_output="[Tool call rejected by user]",
                 tool_final=True,
+                mcp_server_name=_mcp_server,
             )
             return
 
@@ -794,6 +799,7 @@ class OpenAIProvider(LLMProvider):
             tool_call_id=tool_call_id,
             tool_output=result_str,
             tool_final=True,
+            mcp_server_name=_mcp_server,
         )
 
 
@@ -908,6 +914,10 @@ class ToolExecutor:
     def tool_definitions(self) -> list[dict]:
         """Return OpenAI-format tool definitions."""
         return []
+
+    def server_name_for(self, tool_name: str) -> str:
+        """Return the MCP server name that hosts this tool, or '' for local tools."""
+        return ""
 
     async def execute(self, name: str, args: dict) -> Any:
         raise NotImplementedError(f"No executor for tool: {name}")
