@@ -1,6 +1,6 @@
 # KiroCrew-OpenAI-Compatible
 
-**Drop-in OpenAI-compatible backend for [KiroCrew](https://github.com/kirocrew/kirocrew).**
+**Drop-in OpenAI-compatible backend for [KiroCrew](https://github.com/kirodotdev/kirocrew).**
 
 <img width="1918" height="911" alt="image" src="https://github.com/user-attachments/assets/7e5288dd-4d75-48eb-b70a-6dd8608d08c5" />
 
@@ -30,7 +30,7 @@ The provider is installed by monkey-patching `ProviderRegistry.create_factory` a
 ### Prerequisites
 
 - Python 3.10+
-- [KiroCrew](https://github.com/kirocrew/kirocrew) installed (`pip install kirocrew`)
+- [KiroCrew](https://github.com/kirodotdev/kirocrew) installed (`pip install kirocrew`)
 - An OpenAI-compatible API endpoint
 
 > **⚠️ Important — same virtual environment required**
