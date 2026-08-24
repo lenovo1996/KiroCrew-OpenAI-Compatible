@@ -441,6 +441,13 @@ class McpToolExecutor(ToolExecutor):
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
+    def server_name_for(self, tool_name: str) -> str:
+        """Return the MCP server name that hosts this tool, or '' for local tools."""
+        from .mcp_handler_registry import McpHandlerRegistry
+        if tool_name in McpHandlerRegistry._handlers:
+            return ""  # local handler, no MCP server
+        return _tool_server_map.get(tool_name, "")
+
     async def execute(self, name: str, args: dict) -> Any:
         """Execute a tool by name with given args, return string result."""
         if self._definitions_cache is None:
