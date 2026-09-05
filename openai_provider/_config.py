@@ -53,6 +53,13 @@ def lookup_context_window(model: str) -> int | None:
     """Return the known context window for *model*, or ``None``.
 
     Tries an exact key match first, then falls back to prefix matching.
+
+    .. deprecated::
+        Prefer ``kiro_crew.model_registry.model_window()`` — it is the
+        single source of truth and covers more models (kiro-cli cache,
+        supplementary Bedrock/legacy map, ``[1m]`` heuristic).  This
+        function remains as a lightweight fallback for paths that cannot
+        import ``kiro_crew`` (tests, standalone scripts).
     """
     if model in KNOWN_CONTEXT_WINDOWS:
         return KNOWN_CONTEXT_WINDOWS[model]

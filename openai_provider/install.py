@@ -35,6 +35,9 @@ _installed = False
 # receives "auto" (or similar) and returns 404 "model_not_found".
 _MODEL_SENTINELS = frozenset({"auto", ""})
 
+# Timeout for upstream /v1/models HTTP requests (seconds).
+_UPSTREAM_MODELS_TIMEOUT = 10.0
+
 
 def install(
     *,
@@ -122,7 +125,7 @@ def install(
         logger.info("openai_provider: build_provider_factory patched ✅")
 
     except Exception as exc:
-        logger.error("openai_provider: patch failed: %s", exc)
+        logger.warning("openai_provider: build_provider_factory patch failed: %s", exc)
         return
 
     # ── Patch 2: KiroCrewConfig.create_provider_factory (instance method) ───
@@ -179,11 +182,123 @@ def install(
             "openai_provider: bg session patch skipped: %s", exc
         )
 
+    # ── Patch 6: /api/models — upstream-first catalog ───────────────────
+    # Replaces the stock /api/models handler (which shells out to
+    # ``kiro-cli --list-models``) with one that queries the upstream
+    # OpenAI-compatible ``/v1/models`` endpoint first.  The kiro-cli
+    # handler is kept as a graceful fallback if upstream is unreachable.
+    try:
+        _patch_api_models_fallback(cfg["base_url"], cfg["api_key"])
+    except Exception as exc:
+        logger.warning("openai_provider: /api/models fallback patch skipped: %s", exc)
+
     _installed = True
     logger.info(
         "openai_provider installed — model=%s  base_url=%s",
         cfg["model"], cfg["base_url"],
     )
+
+
+async def _fetch_upstream_models(
+    base_url: str, api_key: str,
+) -> list[dict[str, object]] | None:
+    """Fetch and format models from the upstream OpenAI-compatible ``/v1/models``.
+
+    Returns a list of model dicts formatted for the KiroCrew frontend
+    (``{model_name, description, context_window_tokens, rate_multiplier}``),
+    or ``None`` if the upstream is unreachable, returned an error, or served
+    zero models.
+
+    Uses ``model_registry.model_window()`` for context window resolution,
+    falling back to ``0`` for unknown models.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=_UPSTREAM_MODELS_TIMEOUT) as client:
+            resp = await client.get(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "openai_provider: upstream /models returned %d", resp.status_code,
+                )
+                return None
+
+            raw_models = resp.json().get("data", [])
+    except Exception:
+        logger.warning("openai_provider: upstream /models query failed", exc_info=True)
+        return None
+
+    from kiro_crew import model_registry
+
+    formatted = [
+        {
+            "model_name": raw["id"],
+            "description": "",
+            "context_window_tokens": model_registry.model_window(raw["id"]) or 0,
+            "rate_multiplier": 1.0,
+        }
+        for raw in raw_models
+        if raw.get("id")
+    ]
+
+    if not formatted:
+        logger.warning("openai_provider: upstream /models returned 0 models")
+        return None
+
+    logger.info(
+        "openai_provider: upstream /models returned %d models from %s",
+        len(formatted), base_url,
+    )
+    return formatted
+
+
+def _patch_api_models_fallback(base_url: str, api_key: str) -> None:
+    """Replace ``/api/models`` with an upstream-first model catalog.
+
+    Queries the upstream OpenAI-compatible ``/v1/models`` endpoint.  If
+    unavailable, falls back to the stock ``kiro-cli --list-models`` handler.
+    If both fail, returns a 503.
+
+    Also patches the ``handlers`` package-level binding so the aiohttp
+    router (which resolves via ``handlers.api_models``, not
+    ``handlers.agents.api_models``) picks up the replacement.
+    """
+    from kiro_crew.dashboard.handlers import agents as _agents_mod
+
+    _original_handler = _agents_mod.api_models
+
+    async def _api_models_with_upstream(request):  # type: ignore[no-untyped-def]
+        """Upstream-first /api/models with kiro-cli fallback."""
+        from aiohttp import web
+
+        # Try upstream first — it's the authoritative source.
+        models = await _fetch_upstream_models(base_url, api_key)
+        if models is not None:
+            return web.json_response(models)
+
+        # Upstream unavailable — fall back to stock kiro-cli handler.
+        logger.info("openai_provider: falling back to stock kiro-cli /api/models")
+        try:
+            return await _original_handler(request)
+        except Exception:
+            logger.warning(
+                "openai_provider: stock /api/models also failed", exc_info=True,
+            )
+            return web.json_response(
+                {"error": "model list unavailable"}, status=503,
+            )
+
+    # Patch both the module-level and package-level bindings — ``server.py``
+    # routes via ``handlers.api_models`` (the package __init__ re-export),
+    # not ``handlers.agents.api_models``.
+    _agents_mod.api_models = _api_models_with_upstream  # type: ignore[assignment]
+    import kiro_crew.dashboard.handlers as _handlers_pkg
+    _handlers_pkg.api_models = _api_models_with_upstream  # type: ignore[assignment]
+
+    logger.info("openai_provider: /api/models replaced with upstream catalog ✅")
 
 
 def _build_mcp_executor() -> Any:
