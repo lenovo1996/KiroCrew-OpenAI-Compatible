@@ -61,6 +61,20 @@ from ._config import (
 
 logger = logging.getLogger(__name__)
 
+#: Provider prefix KiroCrew puts in front of model ids (``hub-neo/<model>``).
+_MODEL_PREFIX = "hub-neo/"
+
+
+def _bare_model(model: str | None) -> str:
+    """Strip the ``<provider>/`` prefix from a KiroCrew model id.
+
+    The dashboard hands the provider ids like ``hub-neo/llama3:8b``; the OpenAI
+    wire format wants the bare model name, so the prefix is removed once, on the
+    way in.
+    """
+    name = (model or "").strip()
+    return name[len(_MODEL_PREFIX):] if name.startswith(_MODEL_PREFIX) else name
+
 # ── Tool execution registry ──────────────────────────────────────────────────
 # Holds pending tool calls waiting for KiroCrew's approve/reject signal.
 # key = request_id (str), value = asyncio.Future[bool]
@@ -87,7 +101,7 @@ class OpenAIProvider(LLMProvider):
     ) -> None:
         self._base_url = base_url or read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL)
         self._api_key = api_key or read_env_str("OPENAI_API_KEY")
-        self._model = model
+        self._model = _bare_model(model)
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -488,15 +502,41 @@ class OpenAIProvider(LLMProvider):
 
     # ── Main stream ──────────────────────────────────────────────────────────
 
-    async def stream(self, message: str) -> AsyncIterator[AcpEvent]:  # type: ignore[override]
-        """Send a user message and yield AcpEvents until end_turn or cancel."""
+    async def set_model(self, model_id: str) -> None:
+        """Switch the model for the rest of the session.
+
+        KiroCrew's dashboard model picker reaches the provider through this
+        method (``slot_model._try_live_model_switch`` / ``acp_model_effort``).
+        Without it a pick in the UI is silently dropped and every request keeps
+        going to the model that was current when the session was created.
+        """
+        bare = _bare_model(model_id)
+        if bare:
+            self._model = bare
+
+    async def stream(self, message: str, **kwargs: object) -> AsyncIterator[AcpEvent]:  # type: ignore[override]
+        """Send a user message and yield AcpEvents until end_turn or cancel.
+
+        ``**kwargs`` absorbs the extra call-site arguments current KiroCrew
+        builds pass (``allow_image``, ...). Without it every turn dies with
+        ``TypeError: stream() got an unexpected keyword argument``.
+        """
         self._cancel_event.clear()
         self._messages.append({"role": "user", "content": message})
 
         # Auto-compact if context usage is high
         await self._maybe_compact()
 
-        # Tool definitions from executor
+        # Tool definitions from executor. Discovery is async and, when called
+        # from inside a running loop, ``tool_definitions()`` only *schedules* it
+        # and returns an empty list -- which handed the model a tool-less prompt
+        # on the first turn of every session. Await the discovery first.
+        fetch = getattr(self._tool_executor, "_fetch_tools_async", None)
+        if fetch is not None:
+            try:
+                await fetch()
+            except Exception:  # noqa: BLE001
+                pass
         tools = self._tool_executor.tool_definitions()
 
         async for event in self._run_turn(tools):
